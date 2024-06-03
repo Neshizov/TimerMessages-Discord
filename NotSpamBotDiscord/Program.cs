@@ -6,210 +6,163 @@ using System.Threading.Tasks;
 using Newtonsoft.Json.Linq;
 using System.Collections.Generic;
 using System.Timers;
+using System.Linq;
 
 class Program
 {
     static string token;
-    static string serverId;
-    static string channelId;
-    static string messageText;
-    static List<string> imageFiles = new List<string>();
-    static int interval;
+    static List<ChannelConfig> channels = new List<ChannelConfig>();
+
+    class ChannelConfig
+    {
+        public string ServerId { get; set; }
+        public string ChannelId { get; set; }
+        public string MessageText { get; set; }
+        public List<string> ImageFiles { get; set; } = new List<string>();
+        public int Interval { get; set; }
+    }
 
     static async Task Main(string[] args)
     {
+        try
+        {
+            InitializeConfiguration();
+
+            using (var client = new HttpClient())
+            {
+                client.DefaultRequestHeaders.Add("Authorization", token);
+
+                var response = await client.GetAsync("https://discord.com/api/v9/users/@me");
+
+                if (response.IsSuccessStatusCode)
+                {
+                    string responseContent = await response.Content.ReadAsStringAsync();
+                    var json = JObject.Parse(responseContent);
+                    string username = json["username"]?.ToString();
+
+                    Console.WriteLine($"Имя аккаунта: {username}");
+
+                    foreach (var channel in channels)
+                    {
+                        Timer timer = new Timer(channel.Interval * 1000);
+                        timer.Elapsed += async (sender, e) => await SendMessage(client, channel);
+                        timer.Start();
+
+                        Console.WriteLine($"Настроен канал {channel.ServerId}/{channel.ChannelId} с интервалом {channel.Interval} секунд.");
+                    }
+
+                    Console.ReadLine();
+                }
+                else
+                {
+                    Console.WriteLine($"Не удалось войти в аккаунт. Код ошибки: {response.StatusCode}");
+                    Console.ReadLine();
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Произошла ошибка: {ex.Message}");
+            Console.ReadLine();
+        }
+    }
+
+    static void InitializeConfiguration()
+    {
         token = GetTokenFromFile("Config/TOKEN.txt");
         if (string.IsNullOrEmpty(token))
-        {
-            Console.WriteLine("Не удалось прочитать токен из файла.");
-            Console.ReadLine();
-            return;
-        }
+            throw new Exception("Не удалось прочитать токен из файла.");
 
-        string serverLink = GetServerLinkFromFile("Config/SERVER.txt");
-        if (string.IsNullOrEmpty(serverLink) || !ParseServerLink(serverLink))
-        {
-            Console.WriteLine("Ссылка отсутствует или неверного формата. Добавьте ссылку на чат в конфиг, в файл SERVER.txt");
-            Console.ReadLine();
-            return;
-        }
-
-        ReadMessageConfig("Config/MESS.txt");
-        if (interval <= 0)
-        {
-            Console.WriteLine("Не удалось прочитать сообщение или интервал времени из файла.");
-            Console.ReadLine();
-            return;
-        }
-
-        using (var client = new HttpClient())
-        {
-            client.DefaultRequestHeaders.Add("Authorization", token);
-
-            var response = await client.GetAsync("https://discord.com/api/v9/users/@me");
-
-            if (response.IsSuccessStatusCode)
-            {
-                string responseContent = await response.Content.ReadAsStringAsync();
-                var json = JObject.Parse(responseContent);
-                string username = json["username"]?.ToString();
-
-                Console.WriteLine($"Имя аккаунта: {username}");
-                Console.WriteLine($"Ссылка на сервер: {serverLink}");
-
-                Timer timer = new Timer(interval * 1000);
-                timer.Elapsed += async (sender, e) => await SendMessage(client);
-                timer.Start();
-
-                Console.ReadLine();
-            }
-            else
-            {
-                Console.WriteLine($"Не удалось войти в аккаунт. Код ошибки: {response.StatusCode}");
-                Console.ReadLine();
-            }
-        }
+        ReadChannelsConfig("Config/CHANNELS.txt");
+        if (channels.Count == 0)
+            throw new Exception("Не удалось прочитать конфигурацию каналов.");
     }
 
     static string GetTokenFromFile(string filePath)
     {
         if (!File.Exists(filePath))
+            throw new FileNotFoundException("Файл с токеном не найден.");
+
+        var lines = File.ReadAllLines(filePath);
+        foreach (var line in lines)
         {
-            Console.WriteLine("Файл с токеном не найден.");
-            Console.ReadLine();
-            return null;
+            if (line.StartsWith("TOKEN:", StringComparison.OrdinalIgnoreCase))
+                return line.Substring("TOKEN:".Length).Trim();
         }
 
-        try
-        {
-            var lines = File.ReadAllLines(filePath);
-            foreach (var line in lines)
-            {
-                if (line.StartsWith("TOKEN:", StringComparison.OrdinalIgnoreCase))
-                {
-                    return line.Substring("TOKEN:".Length).Trim();
-                }
-            }
-            Console.WriteLine("Токен не найден в файле.");
-            Console.ReadLine();
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Ошибка при чтении файла: {ex.Message}");
-            Console.ReadLine();
-        }
-        return null;
+        throw new Exception("Токен не найден в файле.");
     }
 
-    static string GetServerLinkFromFile(string filePath)
+    static void ReadChannelsConfig(string filePath)
     {
         if (!File.Exists(filePath))
-        {
-            Console.WriteLine("Файл с ссылкой на сервер не найден.");
-            Console.ReadLine();
-            return null;
-        }
+            throw new FileNotFoundException("Файл с конфигурацией каналов не найден.");
 
-        try
+        var lines = File.ReadAllLines(filePath);
+        ChannelConfig currentChannel = null;
+
+        foreach (var line in lines)
         {
-            var lines = File.ReadAllLines(filePath);
-            foreach (var line in lines)
+            if (line.StartsWith("CHANNEL:", StringComparison.OrdinalIgnoreCase))
             {
-                if (Uri.IsWellFormedUriString(line, UriKind.Absolute))
+                if (currentChannel != null)
                 {
-                    return line.Trim();
+                    channels.Add(currentChannel);
+                }
+                currentChannel = new ChannelConfig();
+                var url = line.Substring("CHANNEL:".Length).Trim();
+                var parts = url.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length == 5 && parts[2] == "channels" && parts[3].All(char.IsDigit) && parts[4].All(char.IsDigit))
+                {
+                    currentChannel.ServerId = parts[3].Trim();
+                    currentChannel.ChannelId = parts[4].Trim();
+                }
+                else
+                {
+                    Console.WriteLine($"Неверный формат строки CHANNEL: {url}");
+                    throw new FormatException("Неверный формат строки CHANNEL.");
                 }
             }
-            Console.WriteLine("Ссылка на сервер не найдена в файле.");
-            Console.ReadLine();
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Ошибка при чтении файла: {ex.Message}");
-            Console.ReadLine();
-        }
-        return null;
-    }
-
-    static void ReadMessageConfig(string filePath)
-    {
-        if (!File.Exists(filePath))
-        {
-            Console.WriteLine("Файл с сообщением не найден.");
-            Console.ReadLine();
-            return;
-        }
-
-        try
-        {
-            var lines = File.ReadAllLines(filePath);
-            foreach (var line in lines)
+            else if (line.StartsWith("TEXT:", StringComparison.OrdinalIgnoreCase) && currentChannel != null)
             {
-                if (line.StartsWith("TEXT:", StringComparison.OrdinalIgnoreCase))
+                currentChannel.MessageText = line.Substring("TEXT:".Length).Trim();
+            }
+            else if (line.StartsWith("IMAGE:", StringComparison.OrdinalIgnoreCase) && currentChannel != null)
+            {
+                var images = line.Substring("IMAGE:".Length).Trim().Split(',');
+                foreach (var image in images)
                 {
-                    messageText = line.Substring("TEXT:".Length).Trim();
-                }
-                else if (line.StartsWith("IMAGE:", StringComparison.OrdinalIgnoreCase))
-                {
-                    var images = line.Substring("IMAGE:".Length).Trim().Split(',');
-                    foreach (var image in images)
+                    if (!string.IsNullOrWhiteSpace(image))
                     {
-                        imageFiles.Add(image.Trim());
-                    }
-                }
-                else if (line.StartsWith("TIME:", StringComparison.OrdinalIgnoreCase))
-                {
-                    if (int.TryParse(line.Substring("TIME:".Length).Trim(), out int time))
-                    {
-                        interval = time;
+                        currentChannel.ImageFiles.Add(image.Trim());
                     }
                 }
             }
+            else if (line.StartsWith("TIME:", StringComparison.OrdinalIgnoreCase) && currentChannel != null)
+            {
+                if (int.TryParse(line.Substring("TIME:".Length).Trim(), out int time))
+                {
+                    currentChannel.Interval = time;
+                }
+            }
         }
-        catch (Exception ex)
+
+        if (currentChannel != null)
         {
-            Console.WriteLine($"Ошибка при чтении файла: {ex.Message}");
-            Console.ReadLine();
+            channels.Add(currentChannel);
         }
     }
 
-    static bool ParseServerLink(string serverLink)
-    {
-        try
-        {
-            var uri = new Uri(serverLink);
-            var segments = uri.AbsolutePath.Split('/');
-
-            if (segments.Length >= 3 && segments[1] == "channels")
-            {
-                serverId = segments[2];
-                channelId = segments[3];
-                return true;
-            }
-            else
-            {
-                Console.WriteLine("Неверный формат ссылки.");
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Ошибка при разборе ссылки на сервер: {ex.Message}");
-        }
-        return false;
-    }
-
-    static async Task SendMessage(HttpClient client)
+    static async Task SendMessage(HttpClient client, ChannelConfig channel)
     {
         try
         {
             var content = new MultipartFormDataContent();
 
-            if (messageText != "None")
-            {
-                content.Add(new StringContent(messageText), "content");
-            }
+            if (!string.IsNullOrEmpty(channel.MessageText) && channel.MessageText != "None")
+                content.Add(new StringContent(channel.MessageText), "content");
 
-            foreach (var imageFile in imageFiles)
+            foreach (var imageFile in channel.ImageFiles)
             {
                 string imagePath = Path.Combine("Config", imageFile);
                 if (File.Exists(imagePath))
@@ -225,12 +178,12 @@ class Program
                 }
             }
 
-            Console.WriteLine($"Отправка сообщения в канал {channelId} на сервере {serverId}");
-            var response = await client.PostAsync($"https://discord.com/api/v9/channels/{channelId}/messages", content);
+            Console.WriteLine($"Отправка сообщения в канал {channel.ChannelId} на сервере {channel.ServerId}");
+            var response = await client.PostAsync($"https://discord.com/api/v9/channels/{channel.ChannelId}/messages", content);
             if (response.IsSuccessStatusCode)
             {
                 DateTime now = DateTime.Now;
-                Console.WriteLine($"Сообщение отправлено в {now:HH:mm}. Следующее отправится через {interval} секунд.");
+                Console.WriteLine($"Сообщение отправлено в {now:HH:mm}. Следующее отправится через {channel.Interval} секунд.");
             }
             else
             {
